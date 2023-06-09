@@ -200,3 +200,44 @@ class FrozenClipImageEmbedder(nn.Module):
         # x is assumed to be in range [-1,1]
         return self.model.encode_image(self.preprocess(x))
 
+class ArcFaceEmbedder(AbstractEncoder):
+    def __init__(self, network: str, weight: str):
+        """
+        Builds an ArcFace model
+
+        Arguments:
+            network: The type of network for the backbone (r50, r100, etc)
+            weight: The path to the weights for this backbone network (backbone.pth)
+        """
+        super().__init__()
+        
+        from ldm.modules.arcface.backbones import get_model
+        
+        # Load the model from the ArcFace codebase
+        self.net = get_model(network, fp16=False)
+        self.net.load_state_dict(torch.load(weight))
+    
+    def forward(self, batch: torch.Tensor):
+        """
+        The forward method for this network. Just passes the input
+        through the arcface network.
+
+        Arguments:
+            batch: A batch of images with shape b x c x 112 x 112
+
+        Returns:
+            tensor representing identities for each image with shape b x 512
+        """
+        return self.net(batch)
+
+    def encode(self, images: torch.Tensor):
+        """
+        Encodes the images into identity vectors.
+
+        Arguments:
+            images: The batch of images to encode with shape b x c x 112 x 112
+
+        Returns:
+            tensor representing identities for each image with shape b x 512
+        """
+        return self(images)

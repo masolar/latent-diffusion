@@ -1,6 +1,8 @@
 import argparse, os, sys, datetime, glob, importlib, csv
 import numpy as np
 import time
+from typing import List, Tuple, Dict
+from taming.data.faceshq import IdentityDataset
 import torch
 import torchvision
 import pytorch_lightning as pl
@@ -193,6 +195,31 @@ class DataModuleFromConfig(pl.LightningDataModule):
         if self.wrap:
             for k in self.datasets:
                 self.datasets[k] = WrappedDataset(self.datasets[k])
+    
+    def collate_image_dict(self, batch: List[Dict[str, torch.Tensor]]):
+        """
+        Identity datasets contain multiple images, an identity label, and a number of images
+        per identity. This collate function combines this images into a single tensor, identities
+        into a single list, and number of images into a single number
+
+        Ex: [{"tens1": ..., "identity": ..., "k": ...}, {"tens1": ..., "identity": ..., "k": ...}] ->
+            {"tens1": ..., "identity": [...], "k": ...}
+        """
+        # All dictionaries in the list should have the same set of keys
+        new_dict = {}
+        concat_tensor = []
+        id_batch_list = []
+        for sub_dict in batch:
+            concat_tensor.append(sub_dict['image_batch'])
+            id_batch_list.append(sub_dict['id_batch'])
+
+        new_dict['image_batch'] = torch.cat(concat_tensor)
+        new_dict['id_batch'] = id_batch_list
+
+        # There is an assumption here that each part of the batch has k images
+        new_dict['k'] = batch[0]['k']
+
+        return new_dict
 
     def _train_dataloader(self):
         is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
@@ -200,20 +227,40 @@ class DataModuleFromConfig(pl.LightningDataModule):
             init_fn = worker_init_fn
         else:
             init_fn = None
-        return DataLoader(self.datasets["train"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, shuffle=False if is_iterable_dataset else True,
-                          worker_init_fn=init_fn)
+        
+        # Identity datasets have a weird collate function since they return dictionaries
+        if isinstance(self.datasets['train'], IdentityDataset):
+            return DataLoader(self.datasets["train"], batch_size=self.batch_size,
+                              num_workers=self.num_workers, shuffle=False if is_iterable_dataset else True,
+                              worker_init_fn=init_fn,
+                              collate_fn=self.collate_image_dict)
+        else:
+            return DataLoader(self.datasets["train"], batch_size=self.batch_size,
+                              num_workers=self.num_workers, shuffle=False if is_iterable_dataset else True,
+                              worker_init_fn=init_fn)
+ 
 
     def _val_dataloader(self, shuffle=False):
         if isinstance(self.datasets['validation'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
             init_fn = worker_init_fn
         else:
             init_fn = None
-        return DataLoader(self.datasets["validation"],
-                          batch_size=self.batch_size,
-                          num_workers=self.num_workers,
-                          worker_init_fn=init_fn,
-                          shuffle=shuffle)
+        
+        # Identity datasets have a weird collate function since they return dictionaries
+        if isinstance(self.datasets['validation'], IdentityDataset):
+            return DataLoader(self.datasets["validation"],
+                              batch_size=self.batch_size,
+                              num_workers=self.num_workers,
+                              worker_init_fn=init_fn,
+                              shuffle=shuffle,
+                              collate_fn=self.collate_image_dict)
+        else:
+            return DataLoader(self.datasets["validation"],
+                              batch_size=self.batch_size,
+                              num_workers=self.num_workers,
+                              worker_init_fn=init_fn,
+                              shuffle=shuffle)
+                    
 
     def _test_dataloader(self, shuffle=False):
         is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
