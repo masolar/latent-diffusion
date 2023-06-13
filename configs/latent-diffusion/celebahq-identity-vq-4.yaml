@@ -1,6 +1,6 @@
 model:
   base_learning_rate: 2.0e-06
-  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  target: ldm.models.diffusion.ddpm.IdentityDiffusion
   params:
     linear_start: 0.0015
     linear_end: 0.0195
@@ -68,18 +68,19 @@ model:
 data:     
   target: main.DataModuleFromConfig
   params:
-    batch_size: 48
+    batch_size: 5
     num_workers: 5
     wrap: false
     train:
       target: taming.data.faceshq.CelebAHQIdTrain
       params:
         size: 256
-        k: 3
+        k: 1
     validation:
       target: taming.data.faceshq.CelebAHQIdValidation
       params:
         size: 256
+        k: 1
 
 
 lightning:

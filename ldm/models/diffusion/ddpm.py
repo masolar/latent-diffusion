@@ -6,7 +6,7 @@ https://github.com/CompVis/taming-transformers
 -- merci
 """
 
-from typing import Any
+from typing import Any, Dict, List, Tuple
 import torch
 import torch.nn as nn
 import numpy as np
@@ -327,16 +327,17 @@ class DDPM(pl.LightningModule):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         return self.p_losses(x, t, *args, **kwargs)
 
-    def get_input(self, batch, k):
+    def get_input(self, batch, k, opencv_format=True):
         x = batch[k]
         if len(x.shape) == 3:
             x = x[..., None]
-        x = rearrange(x, 'b h w c -> b c h w')
+        if opencv_format:
+            x = rearrange(x, 'b h w c -> b c h w')
         x = x.to(memory_format=torch.contiguous_format).float()
         return x
 
-    def shared_step(self, batch):
-        x = self.get_input(batch, self.first_stage_key)
+    def shared_step(self, batch, opencv_format=True):
+        x = self.get_input(batch, self.first_stage_key, opencv_format)
         loss, loss_dict = self(x)
         return loss, loss_dict
 
@@ -1510,12 +1511,232 @@ class IdentityDiffusion(LatentDiffusion):
 
     def shared_step(self, batch, **kwargs):
         #x, c = self.get_input(batch, self.first_stage_key)
-        x = batch['image1']
-        encoder_posterior = self.encode_first_stage(x)
+        image1 = batch['image1'] # The original image
+        image2_id = batch['id2']
+
+        encoder_posterior = self.encode_first_stage(image1)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
 
-        loss = self(x, c)
+        model_output, t, noise = self(z, image2_id)
+
+        return model_output, t, noise
+
+    def forward(self, x, c, *args, **kwargs):
+        '''
+        A cleaner forward function that doesn't compute the loss
+        '''
+        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+        noise = torch.randn_like(x)
+        x_noisy = self.q_sample(x_start=x, t=t, noise=noise)
+        model_output = self.apply_model(x_noisy, t, c)
+        
+        '''
+        # This is unnecessary for us, as we're passing in the conditioning vector
+        if self.model.conditioning_key is not None:
+            assert c is not None
+            if self.cond_stage_trainable:
+                c = self.get_learned_conditioning(c)
+            if self.shorten_cond_schedule:  # TODO: drop this option
+                tc = self.cond_ids[t].to(self.device)
+                c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
+        return self.p_losses(x, c, t, *args, **kwargs)
+        '''
+        return model_output, t, noise
+
+    def p_losses(self, 
+                 x_start: torch.Tensor, 
+                 model_output: torch.Tensor, 
+                 t: torch.Tensor, 
+                 noise: torch.Tensor, 
+                 cond: torch.Tensor, 
+                 same_id: int):
+        '''
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        model_output = self.apply_model(x_noisy, t, cond)
+        '''
+
+        loss_dict = {}
+        prefix = 'train' if self.training else 'val'
+
+        if self.parameterization == "x0":
+            target = x_start
+        elif self.parameterization == "eps":
+            target = noise
+        else:
+            raise NotImplementedError()
+
+        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+        loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+        
+        self.logvar = self.logvar.to(t.device)
+        logvar_t = self.logvar[t].to(self.device)
+        loss = loss_simple / torch.exp(logvar_t) + logvar_t
+        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
+        if self.learn_logvar:
+            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
+            loss_dict.update({'logvar': self.logvar.data.mean()})
+
+        loss = self.l_simple_weight * loss.mean()
+
+        loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
+        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+        loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
+        loss += (self.original_elbo_weight * loss_vlb)
+        loss_dict.update({f'{prefix}/loss': loss})
+        
+        # Add in a loss for the identity being different or the same
+        model_output_id = self.get_learned_conditioning(model_output)
+        loss_id = (1 - ((model_output_id @ cond.T).diag())).mean()
+        loss_dict.update({f'{prefix}/loss_id': loss_id})
+        loss += loss_id
+
+        return loss, loss_dict
+
+    @torch.no_grad()
+    def on_train_batch_start(self, batch, batch_idx, dataloader_idx):
+        """
+        This function is triggered before the training batch is run. For the identity network
+        """
+        # only for very first batch
+        if self.scale_by_std and self.current_epoch == 0 and self.global_step == 0 and batch_idx == 0 and not self.restarted_from_ckpt:
+            assert self.scale_factor == 1., 'rather not use custom rescaling and std-rescaling simultaneously'
+            # set rescale weight to 1./std of encodings
+            print("### USING STD-RESCALING ###")
+            #x = super().get_input(batch, self.first_stage_key)
+            x = batch['image_batch']
+            x = x.to(self.device)
+            encoder_posterior = self.encode_first_stage(x)
+            z = self.get_first_stage_encoding(encoder_posterior).detach()
+            del self.scale_factor
+            self.register_buffer('scale_factor', 1. / z.flatten().std())
+            print(f"setting self.scale_factor to {self.scale_factor}")
+            print("### USING STD-RESCALING ###")
+    
+    @torch.no_grad()
+    def compute_dist_mat(self, query_vectors: torch.Tensor, comp_vectors: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the distance matrix between a two groups of vectors
+        Arguments:
+            query_vectors: Row vectors that we want to get distances for
+            comp_vectors: The column vectors used to compute the distance from each query vector
+        Returns:
+            A matrix representing the cosine distance bewtween a particular query vector (row index) and a
+            database vector (col index)
+        """
+        return query_vectors @ comp_vectors
+
+
+    @torch.no_grad()
+    def on_after_batch_transfer(self, batch: Any, dataloader_idx: int) -> Dict[str, torch.Tensor]:
+        """
+        A function that can be used to transform a batch after it has been transferred to a gpu.
+        We do this after to take advantage of the distance matrix computation on the gpu.
+        For an identity network, this would generate the image pairs that would be used by the network.
+        
+        Arguments:
+            batch: The data that the dataloader has for this batch
+            dataloader_idx: The index of the dataloader that the batch belongs to (we don't really need to care about this)
+
+        Returns:
+            A new batch that will be used by the network. It will contain the following elements in a dictionary
+            {
+                image1: The tensor holding the first image for the first stage network
+                image2: The tensor holding the second image for the autoencoder network
+                same_id: A boolean tensor for whether the images are the same identity or different
+                id1: The precomputed id vector for image1
+                id2: The precomputed id vector for image2
+            }
+        """
+        if not self.trainer.testing:
+            # The conditioning network gives an identity vector, so we do that for each image in the batch
+            id_vecs = self.get_learned_conditioning(batch['image_batch'])
+            
+            id_vec_dist = self.compute_dist_mat(id_vecs, id_vecs.T)
+            
+            # We then need to find, for each image in the batch, the hardest image from the same identity
+            # and a different identity. This is the Batch Hard triplet mining from the reidentification paper.
+            
+            # First, get the indices for vectors that are the same identity
+            indices = torch.unsqueeze(torch.arange(id_vec_dist.shape[0]), dim=1).to(id_vecs.device) # num_images x 1
+            same_indices = torch.unsqueeze(torch.arange(0, batch['k']), dim=0).to(id_vecs.device).repeat(id_vec_dist.shape[0], 1) # num_images x k
+
+            same_indices += (indices // batch['k']) * batch['k']
+
+            # Then grab the indices that are for different identities
+            # We'll have to use set operations here
+            indices = torch.squeeze(indices).cpu()
+            different_indices = []
+            for idx_group in same_indices:
+                idx_group = idx_group.cpu()
+                different_indices.append(np.setdiff1d(indices, idx_group, assume_unique=True))
+            
+            # Get the indices for each row that should be different images
+            different_indices = torch.Tensor(np.array(different_indices)).to(id_vecs.device).long()
+
+            # Now we can start to gather the images for each new batch
+            # Get the farthest image from the same identity, which is the
+            # image with the lowest cosine value
+            far_same_image_ind = torch.argmin(torch.gather(id_vec_dist, dim=1, index=same_indices), dim=1, keepdim=True)
+            
+            # The worst image from another identity is the one closest to this one, which has the highest cosine value
+            close_diff_image_ind = torch.argmax(torch.gather(id_vec_dist, dim=1, index=different_indices), dim=1, keepdim=True)
+            
+            # The last two calculations do not give the global index for each image, so we'll get that
+            far_same_image_ind = torch.squeeze(torch.gather(same_indices, dim=1, index=far_same_image_ind))
+            close_diff_image_ind = torch.squeeze(torch.gather(different_indices, dim=1, index=close_diff_image_ind))
+
+            # Get the same identity images and identity vectors
+            same_images = batch['image_batch'][far_same_image_ind]
+            same_identities = id_vecs[far_same_image_ind]
+
+            # Get the differing identity images and identity vectors
+            diff_images = batch['image_batch'][close_diff_image_ind]
+            diff_identities = id_vecs[close_diff_image_ind]
+
+            # Combine into a single batch for the next part of the network
+            image_batch = batch['image_batch'].repeat((2, 1, 1, 1))
+            id_vecs = id_vecs.repeat((2, 1))
+
+            other_image = torch.cat([same_images, diff_images])
+            other_id_vecs = torch.cat([same_identities, diff_identities])
+            
+            # Create a vector to specify whether two images are the same identity or not
+            same_id = torch.cat([torch.ones(batch['image_batch'].shape[0]), torch.zeros(batch['image_batch'].shape[0])])
+
+            return {'image1': image_batch, 'image2': other_image, 'same_id': same_id, 'id1': id_vecs, 'id2': other_id_vecs}
+        else:
+            return batch
+    
+    def training_step(self, batch, batch_idx):
+        """
+        The training step for the network. Should return loss at the end
+        """
+        model_output, t, noise = self.shared_step(batch)
+
+        loss, loss_dict = self.p_losses(batch['image1'], model_output, t, noise, batch['id2'], batch['same_id'])
+
+        self.log_dict(loss_dict, prog_bar=True,
+                      logger=True, on_step=True, on_epoch=True)
+
+        self.log("global_step", self.global_step,
+                 prog_bar=True, logger=True, on_step=True, on_epoch=False)
+
+        if self.use_scheduler:
+            lr = self.optimizers().param_groups[0]['lr']
+            self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
+
         return loss
+
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        model_ouput, t, noise = self.shared_step(batch)
+        _, loss_dict_no_ema = self.p_losses(batch['image1'], model_ouput, t, noise, batch['id2'], batch['same_id'])
+        with self.ema_scope():
+            _, loss_dict_ema = self.p_losses(batch['image1'], model_ouput, t, noise, batch['id2'], batch['same_id'])
+            loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
+        self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
 
     @torch.no_grad()
     def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
@@ -1525,11 +1746,21 @@ class IdentityDiffusion(LatentDiffusion):
         use_ddim = ddim_steps is not None
 
         log = dict()
-        z, c, x, xrec, xc = self.get_input(batch, self.first_stage_key,
-                                           return_first_stage_outputs=True,
-                                           force_c_encode=True,
-                                           return_original_cond=True,
-                                           bs=N)
+        
+        encoder_posterior = self.encode_first_stage(batch['image1'])
+        z = self.get_first_stage_encoding(encoder_posterior).detach()
+
+        c = batch['id2']
+        x = batch['image1']
+        xrec = self.decode_first_stage(z)
+        xc = batch['image2']
+
+        #self.get_input(batch, self.first_stage_key,
+        #                                   return_first_stage_outputs=True,
+        #                                   force_c_encode=True,
+        #                                   return_original_cond=True,
+        #bs=N)
+
         N = min(x.shape[0], N)
         n_row = min(x.shape[0], n_row)
         log["inputs"] = x
@@ -1627,139 +1858,6 @@ class IdentityDiffusion(LatentDiffusion):
             else:
                 return {key: log[key] for key in return_keys}
         return log
-
-    @torch.no_grad()
-    def on_train_batch_start(self, batch, batch_idx, dataloader_idx):
-        """
-        This function is triggered before the training batch is run. For the identity network
-        """
-        # only for very first batch
-        if self.scale_by_std and self.current_epoch == 0 and self.global_step == 0 and batch_idx == 0 and not self.restarted_from_ckpt:
-            assert self.scale_factor == 1., 'rather not use custom rescaling and std-rescaling simultaneously'
-            # set rescale weight to 1./std of encodings
-            print("### USING STD-RESCALING ###")
-            #x = super().get_input(batch, self.first_stage_key)
-            x = batch['image_batch']
-            x = x.to(self.device)
-            encoder_posterior = self.encode_first_stage(x)
-            z = self.get_first_stage_encoding(encoder_posterior).detach()
-            del self.scale_factor
-            self.register_buffer('scale_factor', 1. / z.flatten().std())
-            print(f"setting self.scale_factor to {self.scale_factor}")
-            print("### USING STD-RESCALING ###")
-    
-    @torch.no_grad()
-    def compute_dist_mat(self, query_vectors: torch.Tensor, comp_vectors: torch.Tensor) -> torch.Tensor:
-        """
-        Computes the distance matrix between a two groups of vectors
-        Arguments:
-            query_vectors: Row vectors that we want to get distances for
-            comp_vectors: The column vectors used to compute the distance from each query vector
-        Returns:
-            A matrix representing the cosine distance bewtween a particular query vector (row index) and a
-            database vector (col index)
-        """
-        return query_vectors @ comp_vectors
-
-
-    @torch.no_grad()
-    def on_after_batch_transfer(self, batch: Any, dataloader_idx: int) -> Any:
-        """
-        A function that can be used to transform a batch after it has been transferred to a gpu.
-        We do this after to take advantage of the distance matrix computation on the gpu.
-        For an identity network, this would generate the image pairs that would be used by the network.
-        
-        Arguments:
-            batch: The data that the dataloader has for this batch
-            dataloader_idx: The index of the dataloader that the batch belongs to (we don't really need to care about this)
-
-        Returns:
-            A new batch that will be used by the network. It will contain the following elements in a dictionary
-            {
-                image1: The tensor holding the first image for the first stage network
-                image2: The tensor holding the second image for the autoencoder network
-                same_id: A boolean tensor for whether the images are the same identity or different
-                id1: The precomputed id vector for image1
-                id2: The precomputed id vector for image2
-            }
-        """
-        if self.trainer.training or self.trainer.validation:
-            # The conditioning network gives an identity vector, so we do that for each image in the batch
-            id_vecs = self.get_learned_conditioning(batch['image_batch'])
-            
-            id_vec_dist = self.compute_dist_mat(id_vecs, id_vecs.T)
-            
-            # We then need to find, for each image in the batch, the hardest image from the same identity
-            # and a different identity. This is the Batch Hard triplet mining from the reidentification paper.
-            
-            # First, get the indices for vectors that are the same identity
-            indices = torch.unsqueeze(torch.arange(id_vec_dist.shape[0]), dim=1) # num_images x 1
-
-            same_indices = torch.unsqueeze(torch.arange(0, batch['k']), dim=0).repeat(id_vec_dist.shape[0], 1) # num_images x k
-
-            same_indices += (indices // batch['k']) * batch['k']
-
-            # Then grab the indices that are for different identities
-            # We'll have to use set operations here
-            indices = torch.squeeze(indices)
-            different_indices = []
-            for idx_group in same_indices:
-                different_indices.append(np.setdiff1d(indices, idx_group, assume_unique=True))
-            
-            # Get the indices for each row that should be different images
-            different_indices = torch.Tensor(np.array(different_indices)).long()
-
-            # Now we can start to gather the images for each new batch
-            # Get the farthest image from the same identity, which is the
-            # image with the lowest cosine value
-            far_same_image_ind = torch.argmin(torch.gather(id_vec_dist, dim=1, index=same_indices), dim=1, keepdim=True)
-            
-            # The worst image from another identity is the one closest to this one, which has the highest cosine value
-            close_diff_image_ind = torch.argmax(torch.gather(id_vec_dist, dim=1, index=different_indices), dim=1, keepdim=True)
-            
-            # The last two calculations do not give the global index for each image, so we'll get that
-            far_same_image_ind = torch.squeeze(torch.gather(same_indices, dim=1, index=far_same_image_ind))
-            close_diff_image_ind = torch.squeeze(torch.gather(different_indices, dim=1, index=close_diff_image_ind))
-
-            # Get the same identity images and identity vectors
-            same_images = batch['image_batch'][far_same_image_ind]
-            same_identities = id_vecs[far_same_image_ind]
-
-            # Get the differing identity images and identity vectors
-            diff_images = batch['image_batch'][close_diff_image_ind]
-            diff_identities = id_vecs[close_diff_image_ind]
-
-            # Combine into a single batch for the next part of the network
-            image_batch = batch['image_batch'].repeat((2, 1, 1, 1))
-            id_vecs = id_vecs.repeat((2, 1))
-
-            other_image = torch.cat([same_images, diff_images])
-            other_id_vecs = torch.cat([same_identities, diff_identities])
-            
-            # Create a vector to specify whether two images are the same identity or not
-            same_id = torch.cat([torch.ones(batch['image_batch'].shape[0]), torch.zeros(batch['image_batch'].shape[0])])
-
-            return {'image1': image_batch, 'image2': other_image, 'same_id': same_id, 'id1': id_vecs, 'id2': other_id_vecs}
-        else:
-            return batch
-    
-    def training_step(self, batch, batch_idx):
-        """
-        The training step for the network. Should return loss at the end
-        """
-        loss, loss_dict = self.shared_step(batch)
-
-        self.log_dict(loss_dict, prog_bar=True,
-                      logger=True, on_step=True, on_epoch=True)
-
-        self.log("global_step", self.global_step,
-                 prog_bar=True, logger=True, on_step=True, on_epoch=False)
-
-        if self.use_scheduler:
-            lr = self.optimizers().param_groups[0]['lr']
-            self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
-
-        return loss
 
 
 class Layout2ImgDiffusion(LatentDiffusion):

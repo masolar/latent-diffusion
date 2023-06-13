@@ -214,7 +214,7 @@ class ArcFaceEmbedder(AbstractEncoder):
         from ldm.modules.arcface.backbones import get_model
         
         # Load the model from the ArcFace codebase
-        self.net = get_model(network, fp16=False)
+        self.net = get_model(network, fp16=True)
         self.net.load_state_dict(torch.load(weight))
     
     def forward(self, batch: torch.Tensor):
@@ -228,7 +228,10 @@ class ArcFaceEmbedder(AbstractEncoder):
         Returns:
             tensor representing identities for each image with shape b x 512
         """
-        return self.net(batch)
+        x = kornia.geometry.resize(batch, (112, 112),
+                                   interpolation='bicubic',align_corners=True,
+                                   antialias=False)
+        return self.net(x)
 
     def encode(self, images: torch.Tensor):
         """
@@ -240,4 +243,7 @@ class ArcFaceEmbedder(AbstractEncoder):
         Returns:
             tensor representing identities for each image with shape b x 512
         """
-        return self(images)
+        embedding = self(images)
+        embedding = embedding / torch.unsqueeze(torch.linalg.vector_norm(embedding, dim=1), dim=1)
+
+        return embedding
