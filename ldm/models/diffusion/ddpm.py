@@ -666,6 +666,12 @@ class LatentDiffusion(DDPM):
 
         return fold, unfold, normalization, weighting
 
+    def print_memory_usage(self, msg: str):
+        """
+        Prints the amount of memory currently allocated on the GPU
+        """
+        print(f'{msg}: {torch.cuda.memory_allocated(torch.device("cuda")) / 1000000000}')
+
     @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None):
@@ -876,6 +882,7 @@ class LatentDiffusion(DDPM):
             else:
                 return self.first_stage_model.encode(x)
         else:
+            self.print_memory_usage('Right before first stage encoding')
             return self.first_stage_model.encode(x)
 
     def shared_step(self, batch, **kwargs):
@@ -1513,12 +1520,15 @@ class IdentityDiffusion(LatentDiffusion):
         #x, c = self.get_input(batch, self.first_stage_key)
         image1 = batch['image1'] # The original image
         image2_id = batch['id2']
-
+        
+        self.print_memory_usage('Before first stage encoding')
         encoder_posterior = self.encode_first_stage(image1)
+        self.print_memory_usage('After first stage encoding')
         z = self.get_first_stage_encoding(encoder_posterior).detach()
+        self.print_memory_usage('After get first stage encoding')
 
         model_output, t, noise = self(z, image2_id)
-
+        self.print_memory_usage('After Self call in shared step')
         return model_output, t, noise
 
     def forward(self, x, c, *args, **kwargs):
@@ -1528,7 +1538,9 @@ class IdentityDiffusion(LatentDiffusion):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         noise = torch.randn_like(x)
         x_noisy = self.q_sample(x_start=x, t=t, noise=noise)
+        self.print_memory_usage('Before model output')
         model_output = self.apply_model(x_noisy, t, c)
+        self.print_memory_usage('After model output')
         
         '''
         # This is unnecessary for us, as we're passing in the conditioning vector
@@ -1649,6 +1661,7 @@ class IdentityDiffusion(LatentDiffusion):
             }
         """
         if not self.trainer.testing:
+            self.print_memory_usage('Before batch transfer')
             # The conditioning network gives an identity vector, so we do that for each image in the batch
             id_vecs = self.get_learned_conditioning(batch['image_batch'])
             
@@ -1703,7 +1716,8 @@ class IdentityDiffusion(LatentDiffusion):
             
             # Create a vector to specify whether two images are the same identity or not
             same_id = torch.cat([torch.ones(batch['image_batch'].shape[0]), torch.zeros(batch['image_batch'].shape[0])])
-
+            
+            self.print_memory_usage('After batch transfer')
             return {'image1': image_batch, 'image2': other_image, 'same_id': same_id, 'id1': id_vecs, 'id2': other_id_vecs}
         else:
             return batch
@@ -1730,7 +1744,9 @@ class IdentityDiffusion(LatentDiffusion):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
+        self.print_memory_usage('Before shared step')
         model_ouput, t, noise = self.shared_step(batch)
+        self.print_memory_usage('After shared step')
         _, loss_dict_no_ema = self.p_losses(batch['image1'], model_ouput, t, noise, batch['id2'], batch['same_id'])
         with self.ema_scope():
             _, loss_dict_ema = self.p_losses(batch['image1'], model_ouput, t, noise, batch['id2'], batch['same_id'])
