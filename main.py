@@ -218,7 +218,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
 
         # There is an assumption here that each part of the batch has k images
         new_dict['k'] = batch[0]['k']
-
+        
         return new_dict
 
     def _train_dataloader(self):
@@ -702,7 +702,7 @@ if __name__ == "__main__":
             del callbacks_cfg['ignore_keys_callback']
 
         trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
-
+        
         trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
         trainer.logdir = logdir  ###
 

@@ -32,7 +32,6 @@ def get_timestep_embedding(timesteps, embedding_dim):
 
 def nonlinearity(x):
     # swish
-    print(x.shape)
     return x*torch.sigmoid(x)
 
 
@@ -332,7 +331,6 @@ class Model(nn.Module):
         # downsampling
         hs = [self.conv_in(x)]
 
-        print(f'Memory before broken model: {torch.cuda.memory_allocated(torch.device("cuda")) / 1000000000}')
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
                 h = self.down[i_level].block[i_block](hs[-1], temb)
@@ -453,26 +451,21 @@ class Encoder(nn.Module):
         '''
         # Attempting to reduce memory by avoiding keeping a list of outputs
 
-        print(f'Memory before h conv in: {torch.cuda.memory_allocated(torch.device("cuda")) / 1000000000}')
         h = self.conv_in(x)
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
-                print(f'Memory before changing h: {torch.cuda.memory_allocated(torch.device("cuda")) / 1000000000}')
                 h = self.down[i_level].block[i_block](h, temb)
                 if len(self.down[i_level].attn) > 0:
                     h = self.down[i_level].atten[i_block](h)
-                print(f'Memory after changing h: {torch.cuda.memory_allocated(torch.device("cuda")) / 1000000000}')
             if i_level != self.num_resolutions - 1:
                 h = self.down[i_level].downsample(h)
 
-        print(f'Memory after encoding loop: {torch.cuda.memory_allocated(torch.device("cuda")) / 1000000000}')
         # middle
         # Previous attempt to save memory
         '''
         h = hs[-1]
         del hs
         '''
-        print(f'Memory after deleting hs: {torch.cuda.memory_allocated(torch.device("cuda")) / 1000000000}')
         h = self.mid.block_1(h, temb)
         h = self.mid.attn_1(h)
         h = self.mid.block_2(h, temb)

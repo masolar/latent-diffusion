@@ -68,21 +68,27 @@ model:
 data:     
   target: main.DataModuleFromConfig
   params:
-    batch_size: 5
-    num_workers: 5
+    batch_size: 8
+    num_workers: 24
     wrap: false
     train:
-      target: taming.data.faceshq.CelebAHQIdTrain
+      target: taming.data.faceshq.CelebAId
       params:
         size: 256
-        k: 1
+        k: 3
+        dataset_folder: data/celeba-images/Img/img_celeba
+        id_path: data/celeba-images/Anno/identity_CelebA.txt
+        partition_path: data/celeba-images/Eval/list_eval_partition.txt
+        partition_set: 0
     validation:
-      target: taming.data.faceshq.CelebAHQIdValidation
+      target: taming.data.faceshq.CelebAId
       params:
         size: 256
-        k: 1
-
-
+        k: 3
+        dataset_folder: data/celeba-images/Img/img_celeba
+        id_path: data/celeba-images/Anno/identity_CelebA.txt
+        partition_path: data/celeba-images/Eval/list_eval_partition.txt
+        partition_set: 1
 lightning:
   callbacks:
     image_logger:

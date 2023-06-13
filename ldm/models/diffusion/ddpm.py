@@ -1726,6 +1726,7 @@ class IdentityDiffusion(LatentDiffusion):
         """
         The training step for the network. Should return loss at the end
         """
+        print(f'Training batch shape {batch["image1"].shape}')
         model_output, t, noise = self.shared_step(batch)
 
         loss, loss_dict = self.p_losses(batch['image1'], model_output, t, noise, batch['id2'], batch['same_id'])
@@ -1745,6 +1746,7 @@ class IdentityDiffusion(LatentDiffusion):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
         self.print_memory_usage('Before shared step')
+        print(f'Validation batch shape: {batch["image1"].shape}')
         model_ouput, t, noise = self.shared_step(batch)
         self.print_memory_usage('After shared step')
         _, loss_dict_no_ema = self.p_losses(batch['image1'], model_ouput, t, noise, batch['id2'], batch['same_id'])
